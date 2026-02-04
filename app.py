@@ -26,9 +26,12 @@ print("Model loaded successfully!")
 # Define known lenders with aliases
 # You can expand this list or load from database
 lenders = {
-    "OnDeck": ["ondeck", "ondeck capital", "on deck", "ondeck capital19", "ondeck cap", "on-deck"],
+    "OnDeck": [
+        "ondeck", "ondeck capital", "on deck", "ondeck capital19", "ondeck cap", "on-deck",
+        "ondeck fin", "ondeck financing", "on deck financing", "ondeck payment", "ondeck cap fin"
+    ],
     "Fundbox": ["fundbox", "fundbox inc", "fundbox inc.", "fund box", "fundbox creditsec"],
-    "Revenued": ["revenued", "rev payment", "revenued payment"],
+    "Revenued": ["revenued", "rev payment", "revenued payment", "revenued pmt"],
     "Kabbage": ["kabbage", "kabb", "k servicing", "kabbage inc"],
     "CAN Capital": ["can capital", "cancapital", "can cap"],
     "BlueVine": ["bluevine", "blue vine", "bluevine capital"],
@@ -115,13 +118,18 @@ def health_check():
 
 
 @app.post("/predict", response_model=PredictionResponse)
-def predict_lenders(request: TransactionRequest, confidence_threshold: float = 0.65):
+def predict_lenders(
+    request: TransactionRequest, 
+    confidence_threshold: float = 0.60,
+    min_transactions: int = 4
+):
     """
     Analyze transactions and detect MCA lender patterns
     
     Args:
         request: TransactionRequest with list of transactions
-        confidence_threshold: Minimum similarity score (default: 0.65, was 0.75)
+        confidence_threshold: Minimum similarity score (default: 0.60, lower for better recall)
+        min_transactions: Minimum transactions to identify a position (default: 4)
         
     Returns:
         PredictionResponse with detected lenders and summary
@@ -204,8 +212,8 @@ def predict_lenders(request: TransactionRequest, confidence_threshold: float = 0
         print(f"[DEBUG] Sample debug scores:\n{debug_scores[:5]}")
         
         for lender_name, txns in lender_groups.items():
-            # Require at least 4 transactions to consider it a position
-            if len(txns) >= 4:
+            # Use configurable minimum transactions
+            if len(txns) >= min_transactions:
                 txns_sorted = sorted(txns, key=lambda x: x['date'])
                 amounts = [t['amount'] for t in txns]
                 
@@ -247,7 +255,7 @@ def predict_lenders(request: TransactionRequest, confidence_threshold: float = 0
             model_info={
                 'model_name': 'all-mpnet-base-v2',
                 'confidence_threshold': confidence_threshold,
-                'min_transactions_for_position': 4
+                'min_transactions_for_position': min_transactions
             }
         )
         
@@ -297,8 +305,9 @@ def refresh_lenders(lenders_data: Dict[str, List[str]]):
 def get_lenders():
     """Get currently configured lenders and their aliases"""
     return {
-        "lenders": lenders
+        "lenders": lenders,
     }
+
 
 
 @app.post("/debug-predict")
@@ -344,8 +353,6 @@ def debug_predict(request: TransactionRequest):
                 ]
             })
         
-        
-       
         return {
             "total_transactions": len(debits),
             "results": results,
