@@ -115,12 +115,13 @@ def health_check():
 
 
 @app.post("/predict", response_model=PredictionResponse)
-def predict_lenders(request: TransactionRequest):
+def predict_lenders(request: TransactionRequest, confidence_threshold: float = 0.65):
     """
     Analyze transactions and detect MCA lender patterns
     
     Args:
         request: TransactionRequest with list of transactions
+        confidence_threshold: Minimum similarity score (default: 0.65, was 0.75)
         
     Returns:
         PredictionResponse with detected lenders and summary
@@ -135,6 +136,8 @@ def predict_lenders(request: TransactionRequest):
             if t.get('type', '').lower() == 'debit' and t.get('amount', 0) >= 25
         ]
         
+        print(f"[DEBUG] Total transactions: {len(transactions)}, Debits >= $25: {len(debits)}")
+        
         if len(debits) == 0:
             return PredictionResponse(
                 detected_lenders=[],
@@ -147,19 +150,22 @@ def predict_lenders(request: TransactionRequest):
                 },
                 model_info={
                     'model_name': 'all-mpnet-base-v2',
-                    'confidence_threshold': 0.75,
+                    'confidence_threshold': confidence_threshold,
                     'min_transactions_for_position': 4
                 }
             )
         
         # Extract descriptions
         descriptions = [t.get('description', '') for t in debits]
+        print(f"[DEBUG] First 3 descriptions: {descriptions[:3]}")
         
         # Encode transaction descriptions
         txn_embeddings = model.encode(descriptions, normalize_embeddings=True)
+        print(f"[DEBUG] Generated embeddings shape: {txn_embeddings.shape}")
         
         # Find best matches for each transaction
         lender_groups = {}
+        debug_scores = []
         
         for i, txn in enumerate(debits):
             scores = cosine_similarity([txn_embeddings[i]], lender_embeddings)[0]
@@ -167,8 +173,19 @@ def predict_lenders(request: TransactionRequest):
             score = float(scores[best_idx])
             lender = lender_names[best_idx]
             
-            # High confidence threshold (0.75 for MPNet is very reliable)
-            if score >= 0.75:
+            # Log top 3 matches for debugging
+            top_3_indices = scores.argsort()[-3:][::-1]
+            debug_info = {
+                'description': txn.get('description', ''),
+                'top_matches': [
+                    {'lender': lender_names[idx], 'alias': lender_texts[idx], 'score': round(float(scores[idx]), 3)}
+                    for idx in top_3_indices
+                ]
+            }
+            debug_scores.append(debug_info)
+            
+            # Use configurable confidence threshold
+            if score >= confidence_threshold:
                 if lender not in lender_groups:
                     lender_groups[lender] = []
                 
@@ -181,6 +198,10 @@ def predict_lenders(request: TransactionRequest):
         
         # Build detected_lenders response
         detected_lenders = []
+        
+        print(f"[DEBUG] Lender groups found: {list(lender_groups.keys())}")
+        print(f"[DEBUG] Group sizes: {[(k, len(v)) for k, v in lender_groups.items()]}")
+        print(f"[DEBUG] Sample debug scores:\n{debug_scores[:5]}")
         
         for lender_name, txns in lender_groups.items():
             # Require at least 4 transactions to consider it a position
@@ -212,6 +233,8 @@ def predict_lenders(request: TransactionRequest):
         active_positions = [l for l in detected_lenders if l['status'] == 'Active']
         total_daily_obligation = calculate_daily_obligation(detected_lenders)
         
+        print(f"[DEBUG] Final detected lenders: {len(detected_lenders)}")
+        
         return PredictionResponse(
             detected_lenders=detected_lenders,
             summary={
@@ -223,7 +246,7 @@ def predict_lenders(request: TransactionRequest):
             },
             model_info={
                 'model_name': 'all-mpnet-base-v2',
-                'confidence_threshold': 0.75,
+                'confidence_threshold': confidence_threshold,
                 'min_transactions_for_position': 4
             }
         )
@@ -274,10 +297,67 @@ def refresh_lenders(lenders_data: Dict[str, List[str]]):
 def get_lenders():
     """Get currently configured lenders and their aliases"""
     return {
-        "lenders": lenders,
-        "total_lenders": len(lenders),
-        "total_aliases": len(lender_texts)
+        "lenders": lenders
     }
+
+
+@app.post("/debug-predict")
+def debug_predict(request: TransactionRequest):
+    """
+    Debug endpoint that shows similarity scores for all transactions
+    Helps diagnose why lenders aren't being detected
+    """
+    try:
+        transactions = request.transactions
+        debits = [
+            t for t in transactions 
+            if t.get('type', '').lower() == 'debit' and t.get('amount', 0) >= 25
+        ]
+        
+        if len(debits) == 0:
+            return {"error": "No debit transactions >= $25 found"}
+        
+        descriptions = [t.get('description', '') for t in debits]
+        txn_embeddings = model.encode(descriptions, normalize_embeddings=True)
+        
+        results = []
+        for i, txn in enumerate(debits):
+            scores = cosine_similarity([txn_embeddings[i]], lender_embeddings)[0]
+            
+            # Get top 5 matches
+            top_5_indices = scores.argsort()[-5:][::-1]
+            
+            results.append({
+                'transaction': {
+                    'date': txn.get('date'),
+                    'description': txn.get('description'),
+                    'amount': txn.get('amount')
+                },
+                'top_matches': [
+                    {
+                        'rank': idx + 1,
+                        'lender': lender_names[top_5_indices[idx]],
+                        'alias': lender_texts[top_5_indices[idx]],
+                        'score': round(float(scores[top_5_indices[idx]]), 4)
+                    }
+                    for idx in range(len(top_5_indices))
+                ]
+            })
+        
+        
+       
+        return {
+            "total_transactions": len(debits),
+            "results": results,
+            "thresholds": {
+                "high_confidence": 0.75,
+                "medium_confidence": 0.65,
+                "low_confidence": 0.55
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Debug error: {str(e)}")
 
 
 # Helper functions
