@@ -9,7 +9,7 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from difflib import SequenceMatcher
 
-app = FastAPI(title="FortiFund ML Lender Detection Service (Optimized)", version="2.0.0")
+app = FastAPI(title="FortiFund ML Lender Detection Service (Optimized)", version="2.1.0")
 
 # CORS middleware for Supabase edge functions
 app.add_middleware(
@@ -69,6 +69,21 @@ for lender, aliases in lenders.items():
 print("Encoding lender aliases...")
 lender_embeddings = model.encode(lender_texts, normalize_embeddings=True)
 print(f"Encoded {len(lender_texts)} lender aliases")
+
+# Known non-MCA companies (to prevent false positives)
+# Note: Some companies have capital products that should be included (handled in is_non_mca_company)
+NON_MCA_COMPANIES = [
+    "intuit", "quickbooks", "turbotax",
+    "stripe", "square",
+    "paypal",
+    "google", "microsoft", "amazon", "aws",
+    "shopify",
+    "irs", "state tax", "federal",
+    "utilities", "verizon", "at&t", "comcast",
+    "rent", "lease", "insurance",
+    "salary", "payroll", "adp", "gusto",
+    "uber", "lyft", "doordash", "grubhub"
+]
 
 
 # ============================================================================
@@ -161,15 +176,59 @@ def keyword_match(description: str, lender_alias: str) -> bool:
     return all(any(aw in w for w in words) for aw in alias_words)
 
 
+def is_non_mca_company(description: str) -> bool:
+    """Check if description contains known non-MCA company names"""
+    desc_lower = description.lower()
+    for company in NON_MCA_COMPANIES:
+        if company in desc_lower:
+            # Special cases: some companies have capital products
+            if "capital" in desc_lower and company in ["square", "paypal", "shopify"]:
+                continue
+            return True
+    return False
+
+
+def validate_ach_extraction(description: str, lender_alias: str) -> bool:
+    """
+    Validate that extracted ACH company name matches lender alias.
+    Prevents false positives like 'Intuit' matching to 'Fundbox'.
+    """
+    extracted = extract_company_name_from_ach(description)
+    
+    # If we extracted a clean company name, it MUST match the lender
+    if extracted and extracted != description:
+        # Check if extracted name has similarity to lender alias
+        extracted_lower = extracted.lower()
+        alias_lower = lender_alias.lower()
+        
+        # Require at least 30% fuzzy match or keyword presence
+        fuzzy = fuzzy_match_score(extracted_lower, alias_lower)
+        has_keyword = any(word in extracted_lower for word in alias_lower.split())
+        
+        if fuzzy < 0.3 and not has_keyword:
+            return False  # Extracted name doesn't match lender
+    
+    return True
+
+
 def multi_strategy_match(description: str, lender_alias: str, semantic_score: float) -> Tuple[float, str]:
     """
     Use multiple strategies to match lender:
     1. Semantic similarity (mpNET model)
     2. Keyword matching (exact substring)
     3. Fuzzy matching (for typos/variants)
+    4. Validation (prevent false positives)
     
     Returns: (combined_score, match_method)
     """
+    # VALIDATION 1: Block known non-MCA companies
+    if is_non_mca_company(description):
+        return 0.0, "blocked_non_mca"
+    
+    # VALIDATION 2: If ACH extraction found different company, validate it matches lender
+    if not validate_ach_extraction(description, lender_alias):
+        return 0.0, "ach_mismatch"
+    
     # Strategy 1: Semantic similarity from mpNET
     semantic_weight = semantic_score
     
@@ -277,16 +336,16 @@ class PredictionResponse(BaseModel):
 @app.post("/predict", response_model=PredictionResponse)
 def predict_lenders(
     request: TransactionRequest, 
-    confidence_threshold: float = 0.45,  # LOWERED from 0.60 for better recall on noisy data
-    min_transactions: int = 3  # LOWERED from 4 to catch more patterns
+    confidence_threshold: float = 0.50,  # Balanced for accuracy vs recall
+    min_transactions: int = 4  # Require 4 to avoid false positives
 ):
     """
-    Analyze transactions and detect MCA lender patterns (OPTIMIZED VERSION)
+    Analyze transactions and detect MCA lender patterns (OPTIMIZED v2.1)
     
     Args:
         request: TransactionRequest with list of transactions
-        confidence_threshold: Minimum similarity score (default: 0.45, optimized for noisy ACH data)
-        min_transactions: Minimum transactions to identify a position (default: 3)
+        confidence_threshold: Minimum similarity score (default: 0.50, balanced accuracy)
+        min_transactions: Minimum transactions to identify a position (default: 4)
         
     Returns:
         PredictionResponse with detected lenders and summary
@@ -296,9 +355,12 @@ def predict_lenders(
         
         # Filter debit transactions (MCA payments are debits)
         # Only consider debits >= $25 to filter out small charges
+        # CRITICAL: Filter out empty descriptions
         debits = [
             t for t in transactions 
-            if t.get('type', '').lower() == 'debit' and t.get('amount', 0) >= 25
+            if (t.get('type', '').lower() == 'debit' and 
+                t.get('amount', 0) >= 25 and
+                t.get('description', '').strip() != '')  # Must have description
         ]
         
         print(f"[DEBUG] Total transactions: {len(transactions)}, Debits >= $25: {len(debits)}")
@@ -320,8 +382,9 @@ def predict_lenders(
                     'optimizations_applied': [
                         'ACH description preprocessing',
                         'Multi-strategy matching (semantic+keyword+fuzzy)',
-                        'Lowered confidence threshold',
-                        'Enhanced normalization'
+                        'Smart validation (blocks non-MCA companies)',
+                        'Empty description filtering',
+                        'ACH extraction validation'
                     ]
                 }
             )
@@ -465,8 +528,9 @@ def predict_lenders(
                 'optimizations_applied': [
                     'ACH description preprocessing',
                     'Multi-strategy matching (semantic+keyword+fuzzy)',
-                    'Lowered confidence threshold',
-                    'Enhanced normalization'
+                    'Smart validation (blocks non-MCA companies)',
+                    'Empty description filtering',
+                    'ACH extraction validation'
                 ]
             }
         )
@@ -483,15 +547,17 @@ def predict_lenders(
 # ============================================================================
 
 @app.post("/debug-predict")
-def debug_predict(request: TransactionRequest, confidence_threshold: float = 0.45):
+def debug_predict(request: TransactionRequest, confidence_threshold: float = 0.50):
     """
-    Debug endpoint - returns detailed matching scores for analysis (OPTIMIZED)
+    Debug endpoint - returns detailed matching scores for analysis (OPTIMIZED v2.1)
     """
     try:
         transactions = request.transactions
         debits = [
             t for t in transactions 
-            if t.get('type', '').lower() == 'debit' and t.get('amount', 0) >= 25
+            if (t.get('type', '').lower() == 'debit' and 
+                t.get('amount', 0) >= 25 and
+                t.get('description', '').strip() != '')  # Filter empty descriptions
         ]
         
         if len(debits) == 0:
@@ -559,12 +625,14 @@ def debug_predict(request: TransactionRequest, confidence_threshold: float = 0.4
 def root():
     return {
         "service": "FortiFund ML Lender Detection (Optimized)",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "model": "all-mpnet-base-v2",
         "optimizations": [
             "ACH description preprocessing with regex extraction",
             "Multi-strategy matching (semantic + keyword + fuzzy)",
-            "Lowered confidence threshold (0.45 default)",
+            "Smart validation (blocks non-MCA companies like Intuit)",
+            "ACH extraction validation (prevents false matches)",
+            "Empty description filtering",
             "Enhanced text normalization",
             "Expanded lender alias database"
         ],
