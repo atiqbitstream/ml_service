@@ -9,7 +9,7 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from difflib import SequenceMatcher
 
-app = FastAPI(title="FortiFund ML Lender Detection Service (Optimized)", version="2.1.0")
+app = FastAPI(title="FortiFund ML Lender Detection Service (Optimized)", version="2.2.0")
 
 # CORS middleware for Supabase edge functions
 app.add_middleware(
@@ -71,18 +71,28 @@ lender_embeddings = model.encode(lender_texts, normalize_embeddings=True)
 print(f"Encoded {len(lender_texts)} lender aliases")
 
 # Known non-MCA companies (to prevent false positives)
-# Note: Some companies have capital products that should be included (handled in is_non_mca_company)
 NON_MCA_COMPANIES = [
-    "intuit", "quickbooks", "turbotax",
-    "stripe", "square",
-    "paypal",
-    "google", "microsoft", "amazon", "aws",
-    "shopify",
-    "irs", "state tax", "federal",
-    "utilities", "verizon", "at&t", "comcast",
-    "rent", "lease", "insurance",
-    "salary", "payroll", "adp", "gusto",
-    "uber", "lyft", "doordash", "grubhub"
+    # Tax & Accounting
+    "intuit", "quickbooks", "turbotax", "taxact",
+    # Government entities (common patterns)
+    "state of", "state tax", "department of", "dept of",
+    "irs", "internal revenue", "federal", "treasury",
+    "illinois", "california", "new york", "texas", "florida",
+    "county", "city of", "municipal",
+    # Payment processors (unless capital product)
+    "stripe", "paypal",  # unless "working capital"
+    "square",  # unless "square capital"
+    # Tech companies
+    "google", "microsoft", "amazon", "aws", "meta", "facebook",
+    "shopify",  # unless "shopify capital"
+    # Utilities & Services
+    "utilities", "verizon", "at&t", "t-mobile", "comcast",
+    "electric", "gas company", "water",
+    # Business expenses
+    "rent", "lease", "insurance", "health insurance",
+    "salary", "payroll", "adp", "gusto", "paychex",
+    # Delivery/Gig economy
+    "uber", "lyft", "doordash", "grubhub", "instacart"
 ]
 
 
@@ -99,13 +109,19 @@ def extract_company_name_from_ach(description: str) -> str:
         return ""
     
     # Try to extract "Orig CO Name:" field (most reliable)
-    ach_pattern = r"Orig CO Name:\s*([^O]+?)(?:\s+Orig\s+|$)"
+    # Improved regex: stops at "Orig", "Desc", "ID:", or newline
+    ach_pattern = r"Orig CO Name:\s*([^:\n]+?)(?:\s+(?:Orig|Desc|ID:|Sec:)|$)"
     match = re.search(ach_pattern, description, re.IGNORECASE)
     if match:
         company = match.group(1).strip()
+        
+        # Remove trailing numbers and codes
+        company = re.sub(r'\s+\d{5,}\s*$', '', company)
+        
         # Remove common suffixes that don't help matching
         company = re.sub(r'\s+(Inc\.?|LLC|Corp\.?|Ltd\.?|Co\.?)\s*$', '', company, flags=re.IGNORECASE)
-        return company
+        
+        return company.strip()
     
     return description
 
@@ -129,12 +145,15 @@ def normalize_description(description: str) -> str:
     noise_patterns = [
         r'Orig\s+(?:CO\s+)?Name:',
         r'Orig\s+ID:[^\s]*',
-        r'Desc\s+Date:[^\s]*',
+        r'Desc\s*Date:[^\s]*',
+        r'Descr:[^s]+sec:',  # Catches "Descr:Commercialsec:"
         r'CO\s+Entry\s+Descr:',
+        r'sec:\s*[A-Z]+',  # Catches "sec:CTX", "sec:CCD"
         r'Sec:[A-Z]+',
         r'Trace#:[^\s]+',
         r'Eed:[^\s]+',
         r'Ind\s+(?:ID|Name):[^T]+',
+        r'ID:[A-Z][a-z]\w+',  # Catches "ID:Ac6738015008093"
         r'Trn:[^\s]+Tc?',
         r'Collect:[^\s]+',
         r'\d{10,}',  # Long numbers (likely IDs)
@@ -340,7 +359,12 @@ def predict_lenders(
     min_transactions: int = 4  # Require 4 to avoid false positives
 ):
     """
-    Analyze transactions and detect MCA lender patterns (OPTIMIZED v2.1)
+    Analyze transactions and detect MCA lender patterns (OPTIMIZED v2.2)
+    
+    IMPROVEMENTS IN v2.2:
+    - Enhanced ACH extraction (properly extracts "State of Illinois" not "State of III Descr:...")
+    - Expanded government entity blocking (state, federal, county, city)
+    - Better normalization patterns for CTX/CCD ACH formats
     
     Args:
         request: TransactionRequest with list of transactions
@@ -452,6 +476,10 @@ def predict_lenders(
             }
             debug_scores.append(debug_info)
             
+            # Log blocked transactions for visibility
+            if best_method in ["blocked_non_mca", "ach_mismatch"]:
+                print(f"[BLOCKED] {best_method}: {norm_desc[:50]}")
+            
             # Use LOWERED confidence threshold with multi-strategy score
             if best_score >= confidence_threshold and best_lender:
                 if best_lender not in lender_groups:
@@ -549,7 +577,7 @@ def predict_lenders(
 @app.post("/debug-predict")
 def debug_predict(request: TransactionRequest, confidence_threshold: float = 0.50):
     """
-    Debug endpoint - returns detailed matching scores for analysis (OPTIMIZED v2.1)
+    Debug endpoint - returns detailed matching scores for analysis (OPTIMIZED v2.2)
     """
     try:
         transactions = request.transactions
@@ -625,12 +653,12 @@ def debug_predict(request: TransactionRequest, confidence_threshold: float = 0.5
 def root():
     return {
         "service": "FortiFund ML Lender Detection (Optimized)",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "model": "all-mpnet-base-v2",
         "optimizations": [
-            "ACH description preprocessing with regex extraction",
+            "ACH description preprocessing with improved regex",
             "Multi-strategy matching (semantic + keyword + fuzzy)",
-            "Smart validation (blocks non-MCA companies like Intuit)",
+            "Smart validation (blocks non-MCA: Intuit, government, utilities)",
             "ACH extraction validation (prevents false matches)",
             "Empty description filtering",
             "Enhanced text normalization",
