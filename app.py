@@ -9,7 +9,7 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from difflib import SequenceMatcher
 
-app = FastAPI(title="FortiFund ML Lender Detection Service (Optimized)", version="2.3.1")
+app = FastAPI(title="FortiFund ML Lender Detection Service (Optimized)", version="2.3.2")
 
 # CORS middleware for Supabase edge functions
 app.add_middleware(
@@ -80,11 +80,11 @@ NON_MCA_COMPANIES = [
     "illinois", "california", "new york", "texas", "florida",
     "county", "city of", "municipal",
     # Payment processors (unless capital product)
-    "stripe", "paypal",  # unless "working capital"
-    "square",  # unless "square capital"
+    "stripe", "paypal",
+    "square",
     # Tech companies
     "google", "microsoft", "amazon", "aws", "meta", "facebook",
-    "shopify",  # unless "shopify capital"
+    "shopify",
     # Utilities & Services
     "utilities", "verizon", "at&t", "t-mobile", "comcast",
     "electric", "gas company", "water",
@@ -405,12 +405,12 @@ def predict_lenders(
     min_transactions: int = 4  # Require 4 to avoid false positives
 ):
     """
-    Analyze transactions and detect MCA lender patterns (OPTIMIZED v2.3.1)
+    Analyze transactions and detect MCA lender patterns (OPTIMIZED v2.3.2)
     
-    IMPROVEMENTS IN v2.3.1:
-    - Fixed validation logic flow: invalid extractions now return empty string
-    - Double validation: before and after normalization
-    - Properly filters malformed ACH extractions like "of III"
+    IMPROVEMENTS IN v2.3.2:
+    - Filter empty normalized descriptions BEFORE encoding (prevents spurious matches)
+    - Empty strings no longer create embeddings or get scored
+    - Cleaner processing pipeline
     
     Args:
         request: TransactionRequest with list of transactions
@@ -467,17 +467,50 @@ def predict_lenders(
         print(f"[DEBUG] First 3 raw descriptions: {raw_descriptions[:3]}")
         print(f"[DEBUG] First 3 normalized: {normalized_descriptions[:3]}")
         
+        # Filter out transactions with empty normalized descriptions
+        valid_indices = [i for i, norm in enumerate(normalized_descriptions) if norm.strip() != '']
+        valid_debits = [debits[i] for i in valid_indices]
+        valid_raw_descriptions = [raw_descriptions[i] for i in valid_indices]
+        valid_normalized_descriptions = [normalized_descriptions[i] for i in valid_indices]
+        
+        print(f"[DEBUG] Filtered out {len(debits) - len(valid_debits)} transactions with invalid/empty normalized descriptions")
+        
+        if len(valid_debits) == 0:
+            return PredictionResponse(
+                detected_lenders=[],
+                summary={
+                    'total_positions': 0,
+                    'active_positions': 0,
+                    'total_daily_obligation': 0.0,
+                    'transactions_analyzed': len(transactions),
+                    'debit_transactions': len(debits)
+                },
+                model_info={
+                    'model_name': 'all-mpnet-base-v2-optimized',
+                    'confidence_threshold': confidence_threshold,
+                    'min_transactions_for_position': min_transactions,
+                    'optimizations_applied': [
+                        'ACH description preprocessing',
+                        'Company name validation (rejects fragments)',
+                        'Multi-strategy matching (semantic+keyword+fuzzy)',
+                        'Smart validation (blocks non-MCA companies)',
+                        'Empty description filtering',
+                        'ACH extraction validation'
+                    ]
+                }
+            )
+        
         # Encode NORMALIZED descriptions (cleaner embeddings)
-        txn_embeddings = model.encode(normalized_descriptions, normalize_embeddings=True)
+        txn_embeddings = model.encode(valid_normalized_descriptions, normalize_embeddings=True)
         print(f"[DEBUG] Generated embeddings shape: {txn_embeddings.shape}")
         
         # Find best matches for each transaction using MULTI-STRATEGY matching
         lender_groups = {}
         debug_scores = []
         
-        for i, txn in enumerate(debits):
-            raw_desc = raw_descriptions[i]
-            norm_desc = normalized_descriptions[i]
+        for i, txn in enumerate(valid_debits):
+            raw_desc = valid_raw_descriptions[i]
+            norm_desc = valid_normalized_descriptions[i]
             
             # Get semantic similarity scores
             semantic_scores = cosine_similarity([txn_embeddings[i]], lender_embeddings)[0]
@@ -623,7 +656,7 @@ def predict_lenders(
 @app.post("/debug-predict")
 def debug_predict(request: TransactionRequest, confidence_threshold: float = 0.50):
     """
-    Debug endpoint - returns detailed matching scores for analysis (OPTIMIZED v2.3.1)
+    Debug endpoint - returns detailed matching scores for analysis (OPTIMIZED v2.3.2)
     """
     try:
         transactions = request.transactions
@@ -641,13 +674,22 @@ def debug_predict(request: TransactionRequest, confidence_threshold: float = 0.5
         raw_descriptions = [t.get('description', '') for t in debits]
         normalized_descriptions = [normalize_description(desc) for desc in raw_descriptions]
         
+        # Filter out empty normalized descriptions
+        valid_indices = [i for i, norm in enumerate(normalized_descriptions) if norm.strip() != '']
+        valid_debits = [debits[i] for i in valid_indices]
+        valid_raw_descriptions = [raw_descriptions[i] for i in valid_indices]
+        valid_normalized_descriptions = [normalized_descriptions[i] for i in valid_indices]
+        
+        if len(valid_debits) == 0:
+            return {"message": "No valid transactions after normalization", "results": []}
+        
         # Encode normalized descriptions
-        txn_embeddings = model.encode(normalized_descriptions, normalize_embeddings=True)
+        txn_embeddings = model.encode(valid_normalized_descriptions, normalize_embeddings=True)
         
         results = []
-        for i, txn in enumerate(debits):
-            raw_desc = raw_descriptions[i]
-            norm_desc = normalized_descriptions[i]
+        for i, txn in enumerate(valid_debits):
+            raw_desc = valid_raw_descriptions[i]
+            norm_desc = valid_normalized_descriptions[i]
             
             # Get semantic scores
             semantic_scores = cosine_similarity([txn_embeddings[i]], lender_embeddings)[0]
@@ -682,7 +724,8 @@ def debug_predict(request: TransactionRequest, confidence_threshold: float = 0.5
             })
         
         return {
-            'transactions_analyzed': len(debits),
+            'transactions_analyzed': len(valid_debits),
+            'transactions_filtered': len(debits) - len(valid_debits),
             'confidence_threshold': confidence_threshold,
             'optimizations_enabled': True,
             'results': results
@@ -699,7 +742,7 @@ def debug_predict(request: TransactionRequest, confidence_threshold: float = 0.5
 def root():
     return {
         "service": "FortiFund ML Lender Detection (Optimized)",
-        "version": "2.3.1",
+        "version": "2.3.2",
         "model": "all-mpnet-base-v2",
         "optimizations": [
             "ACH description preprocessing with improved regex",
