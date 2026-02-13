@@ -9,7 +9,7 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from difflib import SequenceMatcher
 
-app = FastAPI(title="FortiFund ML Lender Detection Service (Optimized)", version="2.3.0")
+app = FastAPI(title="FortiFund ML Lender Detection Service (Optimized)", version="2.3.1")
 
 # CORS middleware for Supabase edge functions
 app.add_middleware(
@@ -104,6 +104,7 @@ def extract_company_name_from_ach(description: str) -> str:
     """
     Extract clean company name from noisy ACH transaction descriptions.
     Handles formats like: "Orig CO Name:Fundbox Inc. Orig ID:Fbxinc Desc Date:..."
+    Returns empty string if extraction is invalid.
     """
     if not description:
         return ""
@@ -125,7 +126,7 @@ def extract_company_name_from_ach(description: str) -> str:
         
         # Validate extracted company name (reject fragments)
         if not is_valid_company_name(company):
-            return description  # Return original if extraction looks malformed
+            return ""  # Return empty string for invalid extraction
         
         return company
     
@@ -171,40 +172,46 @@ def normalize_description(description: str) -> str:
     # Extract company name if it's ACH format
     clean_text = extract_company_name_from_ach(description)
     
-    # If extraction failed or returned original, use it
-    if not clean_text or clean_text == description:
-        clean_text = description
+    # If extraction returned empty (invalid), return empty
+    if not clean_text:
+        return ""
     
-    # Additional check: if normalized text looks invalid, return empty
-    # This prevents malformed extractions from being processed
-    if clean_text and not is_valid_company_name(clean_text):
-        return ""  # Will be filtered out as empty description
+    # If extraction returned original description (no ACH pattern found), use it
+    if clean_text == description:
+        # Apply noise removal to original description
+        pass  # Will apply patterns below
     
-    # Remove common ACH noise tokens
-    noise_patterns = [
-        r'Orig\s+(?:CO\s+)?Name:',
-        r'Orig\s+ID:[^\s]*',
-        r'Desc\s*Date:[^\s]*',
-        r'Descr:[^s]+sec:',  # Catches "Descr:Commercialsec:"
-        r'CO\s+Entry\s+Descr:',
-        r'sec:\s*[A-Z]+',  # Catches "sec:CTX", "sec:CCD"
-        r'Sec:[A-Z]+',
-        r'Trace#:[^\s]+',
-        r'Eed:[^\s]+',
-        r'Ind\s+(?:ID|Name):[^T]+',
-        r'ID:[A-Z][a-z]\w+',  # Catches "ID:Ac6738015008093"
-        r'Trn:[^\s]+Tc?',
-        r'Collect:[^\s]+',
-        r'\d{10,}',  # Long numbers (likely IDs)
-    ]
-    
-    for pattern in noise_patterns:
-        clean_text = re.sub(pattern, ' ', clean_text, flags=re.IGNORECASE)
+    # Remove common ACH noise tokens (for non-extracted descriptions)
+    if clean_text == description:  # Only if we didn't extract a clean name
+        noise_patterns = [
+            r'Orig\s+(?:CO\s+)?Name:',
+            r'Orig\s+ID:[^\s]*',
+            r'Desc\s*Date:[^\s]*',
+            r'Descr:[^s]+sec:',  # Catches "Descr:Commercialsec:"
+            r'CO\s+Entry\s+Descr:',
+            r'sec:\s*[A-Z]+',  # Catches "sec:CTX", "sec:CCD"
+            r'Sec:[A-Z]+',
+            r'Trace#:[^\s]+',
+            r'Eed:[^\s]+',
+            r'Ind\s+(?:ID|Name):[^T]+',
+            r'ID:[A-Z][a-z]\w+',  # Catches "ID:Ac6738015008093"
+            r'Trn:[^\s]+Tc?',
+            r'Collect:[^\s]+',
+            r'\d{10,}',  # Long numbers (likely IDs)
+        ]
+        
+        for pattern in noise_patterns:
+            clean_text = re.sub(pattern, ' ', clean_text, flags=re.IGNORECASE)
     
     # Remove extra whitespace
     clean_text = ' '.join(clean_text.split())
+    clean_text = clean_text.strip()
     
-    return clean_text.strip()
+    # Final validation: if result is invalid, return empty
+    if clean_text and not is_valid_company_name(clean_text):
+        return ""
+    
+    return clean_text
 
 
 def fuzzy_match_score(text1: str, text2: str) -> float:
@@ -398,12 +405,12 @@ def predict_lenders(
     min_transactions: int = 4  # Require 4 to avoid false positives
 ):
     """
-    Analyze transactions and detect MCA lender patterns (OPTIMIZED v2.3)
+    Analyze transactions and detect MCA lender patterns (OPTIMIZED v2.3.1)
     
-    IMPROVEMENTS IN v2.3:
-    - Added company name validation (rejects fragments like "of III", "the", "a")
-    - Malformed ACH extractions converted to empty strings (filtered out)
-    - More robust against incomplete ACH data
+    IMPROVEMENTS IN v2.3.1:
+    - Fixed validation logic flow: invalid extractions now return empty string
+    - Double validation: before and after normalization
+    - Properly filters malformed ACH extractions like "of III"
     
     Args:
         request: TransactionRequest with list of transactions
@@ -616,7 +623,7 @@ def predict_lenders(
 @app.post("/debug-predict")
 def debug_predict(request: TransactionRequest, confidence_threshold: float = 0.50):
     """
-    Debug endpoint - returns detailed matching scores for analysis (OPTIMIZED v2.3)
+    Debug endpoint - returns detailed matching scores for analysis (OPTIMIZED v2.3.1)
     """
     try:
         transactions = request.transactions
@@ -692,7 +699,7 @@ def debug_predict(request: TransactionRequest, confidence_threshold: float = 0.5
 def root():
     return {
         "service": "FortiFund ML Lender Detection (Optimized)",
-        "version": "2.3.0",
+        "version": "2.3.1",
         "model": "all-mpnet-base-v2",
         "optimizations": [
             "ACH description preprocessing with improved regex",
