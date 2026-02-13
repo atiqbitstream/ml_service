@@ -9,7 +9,7 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from difflib import SequenceMatcher
 
-app = FastAPI(title="FortiFund ML Lender Detection Service (Optimized)", version="2.2.0")
+app = FastAPI(title="FortiFund ML Lender Detection Service (Optimized)", version="2.3.0")
 
 # CORS middleware for Supabase edge functions
 app.add_middleware(
@@ -121,9 +121,43 @@ def extract_company_name_from_ach(description: str) -> str:
         # Remove common suffixes that don't help matching
         company = re.sub(r'\s+(Inc\.?|LLC|Corp\.?|Ltd\.?|Co\.?)\s*$', '', company, flags=re.IGNORECASE)
         
-        return company.strip()
+        company = company.strip()
+        
+        # Validate extracted company name (reject fragments)
+        if not is_valid_company_name(company):
+            return description  # Return original if extraction looks malformed
+        
+        return company
     
     return description
+
+
+def is_valid_company_name(name: str) -> bool:
+    """
+    Validate that extracted company name looks legitimate.
+    Reject malformed fragments like "of III", "the", etc.
+    """
+    if not name or len(name) < 3:
+        return False
+    
+    name_lower = name.lower().strip()
+    
+    # Reject common fragments/prepositions at start
+    invalid_starts = ["of ", "the ", "a ", "an ", "in ", "at ", "to ", "for "]
+    if any(name_lower.startswith(prefix) for prefix in invalid_starts):
+        return False
+    
+    # Reject if only contains common words
+    common_words = ["of", "the", "a", "an", "iii", "ii", "i"]
+    words = name_lower.split()
+    if all(word in common_words for word in words):
+        return False
+    
+    # Reject if too short (less than 3 characters after stripping)
+    if len(name.replace(" ", "")) < 3:
+        return False
+    
+    return True
 
 
 def normalize_description(description: str) -> str:
@@ -137,9 +171,14 @@ def normalize_description(description: str) -> str:
     # Extract company name if it's ACH format
     clean_text = extract_company_name_from_ach(description)
     
-    # If extraction failed, use original
+    # If extraction failed or returned original, use it
     if not clean_text or clean_text == description:
         clean_text = description
+    
+    # Additional check: if normalized text looks invalid, return empty
+    # This prevents malformed extractions from being processed
+    if clean_text and not is_valid_company_name(clean_text):
+        return ""  # Will be filtered out as empty description
     
     # Remove common ACH noise tokens
     noise_patterns = [
@@ -359,12 +398,12 @@ def predict_lenders(
     min_transactions: int = 4  # Require 4 to avoid false positives
 ):
     """
-    Analyze transactions and detect MCA lender patterns (OPTIMIZED v2.2)
+    Analyze transactions and detect MCA lender patterns (OPTIMIZED v2.3)
     
-    IMPROVEMENTS IN v2.2:
-    - Enhanced ACH extraction (properly extracts "State of Illinois" not "State of III Descr:...")
-    - Expanded government entity blocking (state, federal, county, city)
-    - Better normalization patterns for CTX/CCD ACH formats
+    IMPROVEMENTS IN v2.3:
+    - Added company name validation (rejects fragments like "of III", "the", "a")
+    - Malformed ACH extractions converted to empty strings (filtered out)
+    - More robust against incomplete ACH data
     
     Args:
         request: TransactionRequest with list of transactions
@@ -404,8 +443,7 @@ def predict_lenders(
                     'confidence_threshold': confidence_threshold,
                     'min_transactions_for_position': min_transactions,
                     'optimizations_applied': [
-                        'ACH description preprocessing',
-                        'Multi-strategy matching (semantic+keyword+fuzzy)',
+                        'ACH description preprocessing',                        'Company name validation (rejects fragments)',                        'Multi-strategy matching (semantic+keyword+fuzzy)',
                         'Smart validation (blocks non-MCA companies)',
                         'Empty description filtering',
                         'ACH extraction validation'
@@ -555,6 +593,7 @@ def predict_lenders(
                 'min_transactions_for_position': min_transactions,
                 'optimizations_applied': [
                     'ACH description preprocessing',
+                    'Company name validation (rejects fragments)',
                     'Multi-strategy matching (semantic+keyword+fuzzy)',
                     'Smart validation (blocks non-MCA companies)',
                     'Empty description filtering',
@@ -577,7 +616,7 @@ def predict_lenders(
 @app.post("/debug-predict")
 def debug_predict(request: TransactionRequest, confidence_threshold: float = 0.50):
     """
-    Debug endpoint - returns detailed matching scores for analysis (OPTIMIZED v2.2)
+    Debug endpoint - returns detailed matching scores for analysis (OPTIMIZED v2.3)
     """
     try:
         transactions = request.transactions
@@ -653,10 +692,11 @@ def debug_predict(request: TransactionRequest, confidence_threshold: float = 0.5
 def root():
     return {
         "service": "FortiFund ML Lender Detection (Optimized)",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "model": "all-mpnet-base-v2",
         "optimizations": [
             "ACH description preprocessing with improved regex",
+            "Company name validation (rejects fragments like 'of III')",
             "Multi-strategy matching (semantic + keyword + fuzzy)",
             "Smart validation (blocks non-MCA: Intuit, government, utilities)",
             "ACH extraction validation (prevents false matches)",
