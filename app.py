@@ -71,6 +71,7 @@ lender_embeddings = model.encode(lender_texts, normalize_embeddings=True)
 print(f"Encoded {len(lender_texts)} lender aliases")
 
 # Known non-MCA companies (to prevent false positives)
+# Note: paypal, square, shopify have capital products - is_non_mca_company handles those
 NON_MCA_COMPANIES = [
     # Tax & Accounting
     "intuit", "quickbooks", "turbotax", "taxact",
@@ -79,9 +80,8 @@ NON_MCA_COMPANIES = [
     "irs", "internal revenue", "federal", "treasury",
     "illinois", "california", "new york", "texas", "florida",
     "county", "city of", "municipal",
-    # Payment processors (unless capital product)
-    "stripe", "paypal",
-    "square",
+    # Payment processors (capital products excluded in is_non_mca_company)
+    "stripe", "paypal", "square",
     # Tech companies
     "google", "microsoft", "amazon", "aws", "meta", "facebook",
     "shopify",
@@ -337,25 +337,103 @@ def is_recent(date_str: str, days_threshold: int = 90) -> bool:
         return False
 
 
-def estimate_frequency(transactions: List[Dict]) -> str:
-    """Estimate payment frequency based on transaction dates"""
-    if len(transactions) < 2:
-        return "Unknown"
+def parse_tx_date(tx: Dict) -> Optional[datetime]:
+    """Safely parse ISO date string from transaction; returns None if invalid."""
+    date_str = tx.get('date') or tx.get('transaction_date')
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(str(date_str)[:10], '%Y-%m-%d')
+    except (ValueError, TypeError):
+        return None
+
+
+def median_day_interval(dates: List[datetime]) -> float:
+    """Compute median spacing in days between consecutive dates (sorted)."""
+    if len(dates) < 2:
+        return 0.0
+    intervals = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)]
+    sorted_intervals = sorted(intervals)
+    n = len(sorted_intervals)
+    mid = n // 2
+    if n % 2 == 1:
+        return float(sorted_intervals[mid])
+    return (sorted_intervals[mid - 1] + sorted_intervals[mid]) / 2.0
+
+
+def interval_variance_score(intervals: List[float]) -> float:
+    """
+    Low variance = stable schedule (score near 0).
+    High variance = inconsistent intervals (score near 1).
+    Returns 0-1 where 0 = very consistent, 1 = very inconsistent.
+    """
+    if len(intervals) < 2:
+        return 0.0
+    mean = sum(intervals) / len(intervals)
+    variance = sum((x - mean) ** 2 for x in intervals) / len(intervals)
+    std = variance ** 0.5
+    # Normalize: std/mean gives coefficient of variation; cap at 1.0 for score
+    if mean <= 0:
+        return 1.0
+    cv = std / mean
+    return min(1.0, cv)
+
+
+def classify_product_type(matched_transactions: List[Dict]) -> Tuple[str, float, str]:
+    """
+    Classify product type (MCA vs LOC) from matched transactions for this lender only.
+    Uses ONLY that lender's matched transactions - no global transaction data.
+    Returns (product_type, product_confidence, frequency_label).
+    Stateless - no DB access.
+    """
+    if len(matched_transactions) < 3:
+        return "UNKNOWN", 0.40, "Unknown"
     
-    dates = sorted([datetime.strptime(t['date'], '%Y-%m-%d') for t in transactions])
-    intervals = [(dates[i+1] - dates[i]).days for i in range(len(dates)-1)]
-    avg_interval = sum(intervals) / len(intervals) if intervals else 0
+    dates = []
+    for tx in matched_transactions:
+        d = parse_tx_date(tx)
+        if d:
+            dates.append(d)
+    dates = sorted(dates)
     
-    if avg_interval <= 1.5:
-        return "Daily"
-    elif avg_interval <= 7:
-        return "Weekly"
-    elif avg_interval <= 10:
-        return "Bi-weekly"
-    elif avg_interval <= 35:
-        return "Monthly"
+    if len(dates) < 2:
+        return "UNKNOWN", 0.40, "Unknown"
+    
+    intervals = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)]
+    median = median_day_interval(dates)
+    variance_high = interval_variance_score(intervals) > 0.5  # High = inconsistent schedule
+    
+    tx_count = len(matched_transactions)
+    
+    # Classification by median interval
+    if median <= 10:
+        product_type = "MCA"
+        base_conf = 0.80
+        frequency_label = "Daily/Weekly"
+    elif median >= 20:
+        product_type = "LOC"
+        base_conf = 0.75
+        frequency_label = "Monthly"
     else:
-        return "Irregular"
+        product_type = "UNKNOWN"
+        base_conf = 0.55
+        frequency_label = "Irregular"
+    
+    # Confidence adjustments
+    conf = base_conf
+    if tx_count >= 8:
+        conf += 0.05
+    if variance_high:
+        conf -= 0.10
+    conf = max(0.30, min(0.95, conf))
+    
+    return product_type, round(conf, 3), frequency_label
+
+
+def estimate_frequency(transactions: List[Dict]) -> str:
+    """Estimate payment frequency label (legacy compatibility)."""
+    pt, _, freq = classify_product_type(transactions)
+    return freq
 
 
 def calculate_daily_obligation(detected_lenders: List[Dict]) -> float:
@@ -364,18 +442,23 @@ def calculate_daily_obligation(detected_lenders: List[Dict]) -> float:
     
     for lender in detected_lenders:
         if lender['status'] == 'Active':
-            freq = lender['frequency']
-            avg_amount = lender['average_amount']
+            freq = lender.get('frequency', 'Unknown')
+            avg_amount = lender.get('average_amount', 0)
             
-            # Convert to daily equivalent
-            if freq == "Daily":
+            # Convert to daily equivalent (handles legacy + new frequency labels)
+            freq_lower = (freq or "").lower()
+            if freq_lower in ("daily",):
                 daily_total += avg_amount
-            elif freq == "Weekly":
+            elif freq_lower in ("weekly", "daily/weekly"):
                 daily_total += avg_amount / 5  # Business days
-            elif freq == "Bi-weekly":
+            elif freq_lower in ("bi-weekly", "biweekly"):
                 daily_total += avg_amount / 10
-            elif freq == "Monthly":
+            elif freq_lower == "monthly":
                 daily_total += avg_amount / 22  # ~22 business days/month
+            elif freq_lower in ("irregular", "unknown", ""):
+                daily_total += avg_amount / 22  # Conservative: treat as monthly
+            else:
+                daily_total += avg_amount / 22  # Fallback
     
     return round(daily_total, 2)
 
@@ -594,6 +677,8 @@ def predict_lenders(
                 
                 print(f"[DEBUG] Detected: {lender_name} - {len(txns)} txns, avg_conf={avg_confidence:.3f}, method={primary_method}")
                 
+                # Use ONLY this lender's matched transactions for product type
+                product_type, product_confidence, frequency_label = classify_product_type(txns_sorted)
                 detected_lenders.append({
                     'lender_name': lender_name,
                     'confidence': round(avg_confidence, 3),
@@ -603,7 +688,9 @@ def predict_lenders(
                     'transaction_count': len(txns),
                     'average_amount': round(sum(amounts) / len(amounts), 2),
                     'total_amount': round(sum(amounts), 2),
-                    'frequency': estimate_frequency(txns_sorted),
+                    'frequency': frequency_label,
+                    'product_type': product_type,
+                    'product_confidence': product_confidence,
                     'chronological_transactions': [
                         {
                             'date': t['date'],
