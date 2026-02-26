@@ -639,73 +639,118 @@ def predict_lenders(
         txn_embeddings = model.encode(valid_normalized_descriptions, normalize_embeddings=True)
         print(f"[DEBUG] Generated embeddings shape: {txn_embeddings.shape}")
 
-        # Find best matches for each transaction using MULTI-STRATEGY matching
+        # Find best matches for each transaction
         lender_groups = {}
         debug_scores = []
+        matched_indices_pass1 = set()  # Track which txns matched in pass 1 (DB only)
 
-        for i, txn in enumerate(valid_debits):
-            raw_desc = valid_raw_descriptions[i]
-            norm_desc = valid_normalized_descriptions[i]
+        # PASS 1: Match against DB lenders only (when using DB) - no hardcoded list
+        if use_db_lenders:
+            for i, txn in enumerate(valid_debits):
+                raw_desc = valid_raw_descriptions[i]
+                norm_desc = valid_normalized_descriptions[i]
 
-            # Get semantic similarity scores (use request-time or global embeddings)
-            semantic_scores = cosine_similarity([txn_embeddings[i]], req_lender_embeddings)[0]
+                # Get semantic similarity scores (use request-time or global embeddings)
+                semantic_scores = cosine_similarity([txn_embeddings[i]], req_lender_embeddings)[0]
 
-            # Apply multi-strategy matching for each lender alias
-            best_score = 0.0
-            best_lender = None
-            best_method = ""
+                # Apply multi-strategy matching for each lender alias
+                best_score = 0.0
+                best_lender = None
+                best_method = ""
 
-            for idx, (lender_name, lender_alias) in enumerate(zip(req_lender_names, req_lender_texts)):
-                semantic_score = float(semantic_scores[idx])
+                for idx, (lender_name, lender_alias) in enumerate(zip(req_lender_names, req_lender_texts)):
+                    semantic_score = float(semantic_scores[idx])
+                    
+                    # Use multi-strategy matching (semantic + keyword + fuzzy)
+                    combined_score, match_method = multi_strategy_match(
+                        raw_desc, lender_alias, semantic_score
+                    )
+                    
+                    if combined_score > best_score:
+                        best_score = combined_score
+                        best_lender = lender_name
+                        best_method = match_method
                 
-                # Use multi-strategy matching (semantic + keyword + fuzzy)
-                combined_score, match_method = multi_strategy_match(
-                    raw_desc, lender_alias, semantic_score
-                )
-                
-                if combined_score > best_score:
-                    best_score = combined_score
-                    best_lender = lender_name
-                    best_method = match_method
-            
-            # Log top 3 matches for debugging
-            top_3_indices = semantic_scores.argsort()[-3:][::-1]
-            debug_info = {
-                'raw_description': raw_desc[:80],  # Truncate for readability
-                'normalized': norm_desc,
-                'best_match': {
+                # Log top 3 matches for debugging
+                top_3_indices = semantic_scores.argsort()[-3:][::-1]
+                debug_info = {
+                    'raw_description': raw_desc[:80],  # Truncate for readability
+                    'normalized': norm_desc,
+                    'best_match': {
                     'lender': best_lender,
                     'score': round(best_score, 3),
                     'method': best_method
                 },
-                'top_semantic_matches': [
-                    {
-                        'lender': req_lender_names[idx],
-                        'alias': req_lender_texts[idx],
-                        'semantic_score': round(float(semantic_scores[idx]), 3)
-                    }
-                    for idx in top_3_indices
-                ]
-            }
-            debug_scores.append(debug_info)
-            
-            # Log blocked transactions for visibility
-            if best_method in ["blocked_non_mca", "ach_mismatch"]:
-                print(f"[BLOCKED] {best_method}: {norm_desc[:50]}")
-            
-            # Use LOWERED confidence threshold with multi-strategy score
-            if best_score >= confidence_threshold and best_lender:
-                if best_lender not in lender_groups:
-                    lender_groups[best_lender] = []
+                    'top_semantic_matches': [
+                        {
+                            'lender': req_lender_names[idx],
+                            'alias': req_lender_texts[idx],
+                            'semantic_score': round(float(semantic_scores[idx]), 3)
+                        }
+                        for idx in top_3_indices
+                    ]
+                }
+                debug_scores.append(debug_info)
                 
-                lender_groups[best_lender].append({
-                    'date': txn.get('date'),
-                    'amount': txn.get('amount'),
-                    'description': raw_desc,
-                    'normalized_description': norm_desc,
-                    'score': round(best_score, 3),
-                    'match_method': best_method
-                })
+                # Log blocked transactions for visibility
+                if best_method in ["blocked_non_mca", "ach_mismatch"]:
+                    print(f"[BLOCKED] {best_method}: {norm_desc[:50]}")
+                
+                # Use LOWERED confidence threshold with multi-strategy score
+                if best_score >= confidence_threshold and best_lender:
+                    if best_lender not in lender_groups:
+                        lender_groups[best_lender] = []
+                    
+                    lender_groups[best_lender].append({
+                        'date': txn.get('date'),
+                        'amount': txn.get('amount'),
+                        'description': raw_desc,
+                        'normalized_description': norm_desc,
+                        'score': round(best_score, 3),
+                        'match_method': best_method,
+                        'source': 'database'
+                    })
+                    matched_indices_pass1.add(i)
+
+        # PASS 2: Pattern-based detection - group by extracted name, no hardcoded list
+        # Runs when: (a) DB mode and some txns unmatched, or (b) no DB lenders (pattern-only)
+        run_pattern_pass = (use_db_lenders and len(matched_indices_pass1) < len(valid_debits)) or (not use_db_lenders)
+        if run_pattern_pass:
+            # Group unmatched txns by normalized description (extracted company name from ACH)
+            pattern_groups: Dict[str, List[int]] = {}
+            for i in range(len(valid_debits)):
+                if i in matched_indices_pass1:
+                    continue
+                norm_desc = valid_normalized_descriptions[i]
+                raw_desc = valid_raw_descriptions[i]
+                if not norm_desc or len(norm_desc.strip()) < 3:
+                    continue
+                if is_non_mca_company(raw_desc) or is_non_mca_company(norm_desc):
+                    continue
+                key = norm_desc.strip().lower()
+                if key not in pattern_groups:
+                    pattern_groups[key] = []
+                pattern_groups[key].append(i)
+            # Add groups with recurring pattern (4+ txns) as detected lenders
+            for key, indices in pattern_groups.items():
+                if len(indices) >= min_transactions:
+                    canonical_name = valid_normalized_descriptions[indices[0]].strip()
+                    if canonical_name not in lender_groups:
+                        lender_groups[canonical_name] = []
+                    for i in indices:
+                        txn = valid_debits[i]
+                        lender_groups[canonical_name].append({
+                            'date': txn.get('date'),
+                            'amount': txn.get('amount'),
+                            'description': valid_raw_descriptions[i],
+                            'normalized_description': valid_normalized_descriptions[i],
+                            'score': 0.75,
+                            'match_method': 'pattern',
+                            'source': 'pattern'
+                        })
+            pattern_count = sum(len(indices) for indices in pattern_groups.values() if len(indices) >= min_transactions)
+            if pattern_count > 0:
+                print(f"[DEBUG] Pattern pass: {pattern_count} txns grouped as unknown lenders (no hardcoded list)")
         
         # Build detected_lenders response
         detected_lenders = []
@@ -717,8 +762,10 @@ def predict_lenders(
             print(f"  - {debug_info}")
         
         for lender_name, txns in lender_groups.items():
-            # Known lenders (DB): min 1 txn; unknown: min 4 txns
-            if len(txns) >= min_txns_for_position:
+            # Known lenders (DB): min 1 txn; fallback/unknown: min 4 txns
+            has_db_match = any(t.get('source') == 'database' for t in txns)
+            min_txns = 1 if has_db_match else min_transactions
+            if len(txns) >= min_txns:
                 txns_sorted = sorted(txns, key=lambda x: x['date'])
                 amounts = [t['amount'] for t in txns]
 
@@ -775,9 +822,10 @@ def predict_lenders(
                 'min_transactions_for_position': min_txns_for_position,
                 'lenders_source': 'database' if use_db_lenders else 'hardcoded',
                 'optimizations_applied': (
-                    ['DB-driven lenders', 'ACH description preprocessing', 'Company name validation (rejects fragments)',
-                     'Multi-strategy matching (semantic+keyword+fuzzy)', 'Smart validation (blocks non-MCA companies)',
-                     'Empty description filtering', 'ACH extraction validation']
+                    ['DB-driven lenders', 'Pattern-based unknown detection (no hardcoded list)', 'ACH description preprocessing',
+                     'Company name validation (rejects fragments)', 'Multi-strategy matching (semantic+keyword+fuzzy)',
+                     'Smart validation (blocks non-MCA companies)', 'Empty description filtering',
+                     'ACH extraction validation']
                     if use_db_lenders
                     else ['ACH description preprocessing', 'Company name validation (rejects fragments)',
                           'Multi-strategy matching (semantic+keyword+fuzzy)', 'Smart validation (blocks non-MCA companies)',
