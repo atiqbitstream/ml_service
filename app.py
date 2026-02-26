@@ -379,46 +379,65 @@ def interval_variance_score(intervals: List[float]) -> float:
     return min(1.0, cv)
 
 
-def classify_product_type(matched_transactions: List[Dict]) -> Tuple[str, float, str]:
+def classify_product_type(
+    matched_transactions: List[Dict],
+    lender_product_types: Optional[List[str]] = None
+) -> Tuple[str, float, str]:
     """
     Classify product type (MCA vs LOC) from matched transactions for this lender only.
-    Uses ONLY that lender's matched transactions - no global transaction data.
+    Uses pattern (median interval) and optionally lender's product types from DB.
     Returns (product_type, product_confidence, frequency_label).
-    Stateless - no DB access.
     """
+    # Known lender with 1-2 txns: if only one product type, use it
+    if lender_product_types and len(lender_product_types) == 1 and len(matched_transactions) < 3:
+        return lender_product_types[0], 0.60, "Unknown"
+
     if len(matched_transactions) < 3:
         return "UNKNOWN", 0.40, "Unknown"
-    
+
     dates = []
     for tx in matched_transactions:
         d = parse_tx_date(tx)
         if d:
             dates.append(d)
     dates = sorted(dates)
-    
+
     if len(dates) < 2:
         return "UNKNOWN", 0.40, "Unknown"
-    
+
     intervals = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)]
     median = median_day_interval(dates)
-    variance_high = interval_variance_score(intervals) > 0.5  # High = inconsistent schedule
-    
+    variance_high = interval_variance_score(intervals) > 0.5
+
     tx_count = len(matched_transactions)
-    
-    # Classification by median interval
+
+    # Pattern-based classification
     if median <= 10:
-        product_type = "MCA"
+        pattern_type = "MCA"
         base_conf = 0.80
         frequency_label = "Daily/Weekly"
     elif median >= 20:
-        product_type = "LOC"
+        pattern_type = "LOC"
         base_conf = 0.75
         frequency_label = "Monthly"
     else:
-        product_type = "UNKNOWN"
+        pattern_type = "UNKNOWN"
         base_conf = 0.55
         frequency_label = "Irregular"
-    
+
+    # Use lender's product types from DB when available
+    if lender_product_types and len(lender_product_types) > 0:
+        if len(lender_product_types) == 1:
+            return lender_product_types[0], max(base_conf, 0.70), frequency_label
+        if pattern_type in lender_product_types:
+            product_type = pattern_type
+        else:
+            # Pattern doesn't match; pick first from lender's types
+            product_type = lender_product_types[0]
+            base_conf = 0.60
+    else:
+        product_type = pattern_type
+
     # Confidence adjustments
     conf = base_conf
     if tx_count >= 8:
@@ -426,7 +445,7 @@ def classify_product_type(matched_transactions: List[Dict]) -> Tuple[str, float,
     if variance_high:
         conf -= 0.10
     conf = max(0.30, min(0.95, conf))
-    
+
     return product_type, round(conf, 3), frequency_label
 
 
@@ -467,8 +486,15 @@ def calculate_daily_obligation(detected_lenders: List[Dict]) -> float:
 # REQUEST/RESPONSE MODELS
 # ============================================================================
 
+class KnownLenderConfig(BaseModel):
+    lender_name: str
+    aliases: List[str]
+    product_types: Optional[List[str]] = None
+
+
 class TransactionRequest(BaseModel):
     transactions: List[Dict]
+    known_lenders: Optional[List[KnownLenderConfig]] = None  # DB-driven; when provided, use instead of hardcoded
 
 
 class PredictionResponse(BaseModel):
@@ -582,28 +608,54 @@ def predict_lenders(
                     ]
                 }
             )
-        
+
+        # DB-driven lenders: use known_lenders from request when provided
+        use_db_lenders = (
+            request.known_lenders is not None
+            and len(request.known_lenders) > 0
+        )
+        if use_db_lenders:
+            _names, _texts = [], []
+            lender_product_types_map = {}
+            for L in request.known_lenders:
+                aliases = L.aliases if L.aliases else [L.lender_name]
+                for a in aliases:
+                    _names.append(L.lender_name)
+                    _texts.append(str(a).lower())
+                lender_product_types_map[L.lender_name] = L.product_types or []
+            req_lender_names = _names
+            req_lender_texts = _texts
+            req_lender_embeddings = model.encode(req_lender_texts, normalize_embeddings=True)
+            min_txns_for_position = 1  # Known lenders: 1-2 txns = still flag
+            print(f"[DEBUG] Using DB lenders: {len(req_lender_names)} aliases for {len(set(req_lender_names))} lenders")
+        else:
+            req_lender_names = lender_names
+            req_lender_texts = lender_texts
+            req_lender_embeddings = lender_embeddings
+            lender_product_types_map = {}
+            min_txns_for_position = min_transactions
+
         # Encode NORMALIZED descriptions (cleaner embeddings)
         txn_embeddings = model.encode(valid_normalized_descriptions, normalize_embeddings=True)
         print(f"[DEBUG] Generated embeddings shape: {txn_embeddings.shape}")
-        
+
         # Find best matches for each transaction using MULTI-STRATEGY matching
         lender_groups = {}
         debug_scores = []
-        
+
         for i, txn in enumerate(valid_debits):
             raw_desc = valid_raw_descriptions[i]
             norm_desc = valid_normalized_descriptions[i]
-            
-            # Get semantic similarity scores
-            semantic_scores = cosine_similarity([txn_embeddings[i]], lender_embeddings)[0]
-            
+
+            # Get semantic similarity scores (use request-time or global embeddings)
+            semantic_scores = cosine_similarity([txn_embeddings[i]], req_lender_embeddings)[0]
+
             # Apply multi-strategy matching for each lender alias
             best_score = 0.0
             best_lender = None
             best_method = ""
-            
-            for idx, (lender_name, lender_alias) in enumerate(zip(lender_names, lender_texts)):
+
+            for idx, (lender_name, lender_alias) in enumerate(zip(req_lender_names, req_lender_texts)):
                 semantic_score = float(semantic_scores[idx])
                 
                 # Use multi-strategy matching (semantic + keyword + fuzzy)
@@ -628,8 +680,8 @@ def predict_lenders(
                 },
                 'top_semantic_matches': [
                     {
-                        'lender': lender_names[idx],
-                        'alias': lender_texts[idx],
+                        'lender': req_lender_names[idx],
+                        'alias': req_lender_texts[idx],
                         'semantic_score': round(float(semantic_scores[idx]), 3)
                     }
                     for idx in top_3_indices
@@ -665,20 +717,23 @@ def predict_lenders(
             print(f"  - {debug_info}")
         
         for lender_name, txns in lender_groups.items():
-            # Use configurable minimum transactions (LOWERED to 3)
-            if len(txns) >= min_transactions:
+            # Known lenders (DB): min 1 txn; unknown: min 4 txns
+            if len(txns) >= min_txns_for_position:
                 txns_sorted = sorted(txns, key=lambda x: x['date'])
                 amounts = [t['amount'] for t in txns]
-                
+
                 # Calculate average confidence and check match methods
                 avg_confidence = sum(t['score'] for t in txns) / len(txns)
                 match_methods = [t.get('match_method', 'semantic_only') for t in txns]
                 primary_method = max(set(match_methods), key=match_methods.count)
-                
+
                 print(f"[DEBUG] Detected: {lender_name} - {len(txns)} txns, avg_conf={avg_confidence:.3f}, method={primary_method}")
-                
-                # Use ONLY this lender's matched transactions for product type
-                product_type, product_confidence, frequency_label = classify_product_type(txns_sorted)
+
+                # Product type: use lender's product_types from DB when available
+                pt_list = lender_product_types_map.get(lender_name)
+                product_type, product_confidence, frequency_label = classify_product_type(
+                    txns_sorted, lender_product_types=pt_list
+                )
                 detected_lenders.append({
                     'lender_name': lender_name,
                     'confidence': round(avg_confidence, 3),
@@ -717,18 +772,20 @@ def predict_lenders(
             model_info={
                 'model_name': 'all-mpnet-base-v2-optimized',
                 'confidence_threshold': confidence_threshold,
-                'min_transactions_for_position': min_transactions,
-                'optimizations_applied': [
-                    'ACH description preprocessing',
-                    'Company name validation (rejects fragments)',
-                    'Multi-strategy matching (semantic+keyword+fuzzy)',
-                    'Smart validation (blocks non-MCA companies)',
-                    'Empty description filtering',
-                    'ACH extraction validation'
-                ]
+                'min_transactions_for_position': min_txns_for_position,
+                'lenders_source': 'database' if use_db_lenders else 'hardcoded',
+                'optimizations_applied': (
+                    ['DB-driven lenders', 'ACH description preprocessing', 'Company name validation (rejects fragments)',
+                     'Multi-strategy matching (semantic+keyword+fuzzy)', 'Smart validation (blocks non-MCA companies)',
+                     'Empty description filtering', 'ACH extraction validation']
+                    if use_db_lenders
+                    else ['ACH description preprocessing', 'Company name validation (rejects fragments)',
+                          'Multi-strategy matching (semantic+keyword+fuzzy)', 'Smart validation (blocks non-MCA companies)',
+                          'Empty description filtering', 'ACH extraction validation']
+                )
             }
         )
-    
+
     except Exception as e:
         import traceback
         error_detail = traceback.format_exc()
