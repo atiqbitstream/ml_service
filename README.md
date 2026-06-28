@@ -1,69 +1,114 @@
+<div align="center">
+
 # FortiFund ML Lender Detection Service
 
-FastAPI microservice for detecting MCA (Merchant Cash Advance) lender patterns in bank transactions using MPNet transformer model.
+![license](https://img.shields.io/badge/license-MIT-green)
+![python](https://img.shields.io/badge/python-3.11-blue)
+![framework](https://img.shields.io/badge/framework-FastAPI-009688)
+![model](https://img.shields.io/badge/model-all--mpnet--base--v2-orange)
+![status](https://img.shields.io/badge/status-prototype-yellow)
+
+**A FastAPI service that detects Merchant Cash Advance (MCA) lender payments in bank transaction data using sentence-transformer embeddings, keyword, and fuzzy matching.**
+
+<!-- TODO: screenshot/GIF - capture a sample /predict request and JSON response, e.g. via the Swagger UI at /docs -->
+
+</div>
+
+> [!NOTE]
+> This is a working prototype (service version `2.3.2`). The detection logic combines a transformer model with keyword and fuzzy rules. Accuracy numbers are not measured in this repository, so treat the matching as heuristic rather than guaranteed.
+
+## Table of Contents
+
+- [About](#about)
+- [Features](#features)
+- [Tech Stack](#tech-stack)
+- [Getting Started](#getting-started)
+- [Usage](#usage)
+- [API Reference](#api-reference)
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [Configuration](#configuration)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [License](#license)
+
+## About
+
+This service reads a list of bank transactions and finds recurring payments that look like Merchant Cash Advance (MCA) or Line of Credit (LOC) repayments to known funding companies. It was built to run behind a Supabase Edge Function (CORS is open by default), but it is a plain HTTP API and can be called from anything.
+
+For each transaction it filters debits of at least `$25` that carry a description, cleans up noisy ACH text (for example `Orig CO Name:Fundbox Inc. Orig ID:Fbxinc...`), and then scores the cleaned text against a list of known lenders. Matching uses three signals at once: semantic similarity from the `all-mpnet-base-v2` sentence-transformer, exact keyword presence, and fuzzy string ratio. A validation step blocks known non-MCA payees (tax agencies, utilities, payroll providers, and similar) to cut false positives.
+
+The lender list can come from the request itself (a database-driven `known_lenders` field) or fall back to a built-in dictionary of 17 lenders and their aliases. Transactions that match no known lender can still be grouped into "unknown" positions when the same cleaned name repeats often enough.
 
 ## Features
 
-- **High Accuracy**: Uses `all-mpnet-base-v2` model for 90-95% accuracy
-- **Fast Processing**: Analyzes hundreds of transactions in 1-2 seconds
-- **RESTful API**: Easy integration with Supabase Edge Functions
-- **Dynamic Lender Management**: Add/update lenders without redeployment
-- **CORS Enabled**: Works seamlessly with Supabase
+- MCA and LOC lender detection from raw bank transaction lists.
+- ACH description preprocessing that extracts a clean company name from noisy text.
+- Multi-strategy matching: semantic embeddings plus keyword plus fuzzy ratio.
+- Non-MCA payee filtering to reduce false positives (tax, government, utilities, payroll, gig apps).
+- Database-driven lenders via the request body, or a built-in list of 17 lenders as fallback.
+- Product type guess (MCA vs LOC) and payment frequency label from transaction spacing.
+- Daily payment obligation estimate across active positions.
+- Built-in debug endpoint that returns per-transaction match scores.
+- Open CORS so it can be called from Supabase Edge Functions or a browser.
 
-## Model Information
+## Tech Stack
 
-- **Model**: `sentence-transformers/all-mpnet-base-v2`
-- **Accuracy**: 90-95% on financial transaction data
-- **Confidence Threshold**: 0.75 (high confidence matches only)
-- **Minimum Transactions**: Requires 4+ transactions to identify a position
+| Layer | Technology |
+|-------|------------|
+| Language | Python 3.11 |
+| Web framework | FastAPI |
+| ASGI server | Uvicorn |
+| Embeddings | sentence-transformers (`all-mpnet-base-v2`) |
+| ML runtime | PyTorch |
+| Similarity / utils | scikit-learn (cosine similarity), pandas, difflib |
+| Validation | Pydantic |
+| Deploy target | Render (see `render.yaml`) |
 
-## API Endpoints
+## Getting Started
 
-### `GET /`
-Health check endpoint
+### Prerequisites
 
-**Response:**
-```json
-{
-  "status": "healthy",
-  "service": "FortiFund ML Lender Detection",
-  "model": "all-mpnet-base-v2",
-  "version": "1.0.0"
-}
+```bash
+python --version   # 3.11 or newer
+pip --version
 ```
 
-### `GET /health`
-Detailed health check
+### Installation
 
-**Response:**
-```json
-{
-  "status": "healthy",
-  "model_loaded": true,
-  "lenders_configured": 15,
-  "total_aliases": 67,
-  "model_name": "sentence-transformers/all-mpnet-base-v2"
-}
+```bash
+git clone https://github.com/atiqbitstream/ml_service.git
+cd ml_service
+
+python -m venv venv
+# Linux / macOS
+source venv/bin/activate
+# Windows
+venv\Scripts\activate
+
+pip install -r requirements.txt
 ```
 
-### `POST /predict`
-Analyze transactions and detect lender patterns
+### Run
 
-**Request:**
-```json
-{
-  "transactions": [
-    {
-      "date": "2024-01-15",
-      "description": "ONDECK CAP FIN",
-      "amount": 500.00,
-      "type": "debit"
-    }
-  ]
-}
+```bash
+uvicorn app:app --reload --host 0.0.0.0 --port 8000
 ```
 
-**Response:**
+The first start downloads the `all-mpnet-base-v2` model (around 420 MB), so give it a moment. Once it prints `Model loaded successfully!`, the API is live on port `8000`. Interactive docs are at `http://localhost:8000/docs`.
+
+## Usage
+
+A sample request body ships in `test_sample.json`. Send it to `/predict`:
+
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d @test_sample.json
+```
+
+Each transaction needs `date` (`YYYY-MM-DD`), `description`, `amount`, and `type` (`debit` or `credit`). Only debits of at least `$25` with a description are analyzed. Example response shape:
+
 ```json
 {
   "detected_lenders": [
@@ -72,270 +117,105 @@ Analyze transactions and detect lender patterns
       "confidence": 0.873,
       "status": "Active",
       "first_seen": "2024-01-01",
-      "last_seen": "2024-01-15",
-      "transaction_count": 12,
-      "average_amount": 485.50,
-      "total_amount": 5826.00,
-      "frequency": "daily",
-      "chronological_transactions": [...]
+      "last_seen": "2024-01-04",
+      "transaction_count": 4,
+      "average_amount": 496.38,
+      "total_amount": 1985.5,
+      "frequency": "Daily/Weekly",
+      "product_type": "MCA",
+      "product_confidence": 0.8,
+      "chronological_transactions": []
     }
   ],
   "summary": {
     "total_positions": 1,
-    "active_positions": 1,
-    "total_daily_obligation": 485.50,
-    "transactions_analyzed": 340,
-    "debit_transactions": 145
+    "active_positions": 0,
+    "total_daily_obligation": 0.0,
+    "transactions_analyzed": 14,
+    "debit_transactions": 12
   },
   "model_info": {
-    "model_name": "all-mpnet-base-v2",
-    "confidence_threshold": 0.75,
+    "model_name": "all-mpnet-base-v2-optimized",
+    "confidence_threshold": 0.5,
     "min_transactions_for_position": 4
   }
 }
 ```
 
-### `GET /lenders`
-Get configured lenders and aliases
+`status` is `Active` only when the latest matched transaction is within the last 90 days, so older sample data will show `Past`.
 
-**Response:**
+To use your own lender list, add a `known_lenders` array to the request:
+
 ```json
 {
-  "lenders": {
-    "OnDeck": ["ondeck", "ondeck capital", "on deck"],
-    "Fundbox": ["fundbox", "fundbox inc"]
-  },
-  "total_lenders": 15,
-  "total_aliases": 67
+  "transactions": [ { "date": "2024-01-01", "description": "ACME CAP", "amount": 300, "type": "debit" } ],
+  "known_lenders": [
+    { "lender_name": "Acme Capital", "aliases": ["acme cap", "acme"], "product_types": ["MCA"] }
+  ]
 }
 ```
 
-### `POST /refresh-lenders`
-Update lenders dynamically (useful when SuperAdmin adds new lenders)
+## API Reference
 
-**Request:**
-```json
-{
-  "OnDeck": ["ondeck", "ondeck capital", "on deck"],
-  "NewLender": ["new lender", "nl payments"]
-}
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | Service info, version, and endpoint list. |
+| `GET` | `/health` | Health check: model loaded, lender and alias counts. |
+| `GET` | `/lenders` | The built-in lender dictionary with all aliases. |
+| `POST` | `/predict` | Detect lenders. Query params: `confidence_threshold` (default `0.50`), `min_transactions` (default `4`). |
+| `POST` | `/debug-predict` | Per-transaction match scores for the top 10 lenders. |
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Client[Client / Supabase Edge Function] -->|POST /predict| API[FastAPI app]
+    API --> Filter[Filter debits >= 25 with description]
+    Filter --> Norm[Normalize ACH descriptions]
+    Norm --> Encode[Encode with all-mpnet-base-v2]
+    Encode --> Match[Multi-strategy match: semantic + keyword + fuzzy]
+    Lenders[(Lender aliases: request or built-in)] --> Match
+    Match --> Validate[Block non-MCA payees]
+    Validate --> Group[Group by lender and classify MCA / LOC]
+    Group -->|JSON| Client
 ```
 
-**Response:**
-```json
-{
-  "status": "success",
-  "message": "Lenders updated successfully",
-  "total_lenders": 16,
-  "total_aliases": 70
-}
+## Project Structure
+
+```text
+ml_service/
+├── app.py              # FastAPI app: endpoints, matching logic, lender data
+├── requirements.txt    # Python dependencies
+├── runtime.txt         # Python version pin for Render
+├── render.yaml         # Render web service config
+├── test_sample.json    # Example /predict request body
+├── .env.example        # Example environment variables
+└── README.md
 ```
 
-## Local Development
+## Configuration
 
-### Prerequisites
+The app does not require environment variables to run locally. The variables below apply to deployment (see `.env.example` and `render.yaml`).
 
-- Python 3.11+
-- pip
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PORT` | Port the Uvicorn server binds to | `8000` |
+| `PYTHON_VERSION` | Python version for the deploy platform | `3.11.0` |
 
-### Setup
+Detection behavior is tuned through query parameters on `/predict` rather than env vars: `confidence_threshold` (default `0.50`) and `min_transactions` (default `4`).
 
-1. **Create virtual environment:**
-```bash
-python -m venv venv
-```
+## Roadmap
 
-2. **Activate virtual environment:**
-```bash
-# Windows
-venv\Scripts\activate
+- [ ] Add an automated test suite and measured accuracy figures.
+- [ ] Persist detected positions instead of computing per request.
+- [ ] Make the built-in lender list and thresholds configurable without code edits.
+- [ ] Add authentication for production deployments.
+- [ ] Containerize with a Dockerfile for portable deploys.
 
-# Linux/Mac
-source venv/bin/activate
-```
+## Contributing
 
-3. **Install dependencies:**
-```bash
-pip install -r requirements.txt
-```
-
-4. **Run the service:**
-```bash
-uvicorn app:app --reload --host 0.0.0.0 --port 8000
-```
-
-5. **Test the service:**
-```bash
-# Health check
-curl http://localhost:8000/health
-
-# Test prediction (create a test.json file with sample transactions)
-curl -X POST http://localhost:8000/predict \
-  -H "Content-Type: application/json" \
-  -d @test.json
-```
-
-## Deployment to Render.com
-
-### Option 1: Using render.yaml (Recommended)
-
-1. Create a Render.com account
-2. Connect your GitHub repository
-3. Render will automatically detect `render.yaml`
-4. Click "Deploy"
-5. Get your service URL: `https://fortifund-ml-service.onrender.com`
-
-### Option 2: Manual Setup
-
-1. **Create New Web Service** on Render.com
-2. **Settings:**
-   - **Name**: fortifund-ml-service
-   - **Runtime**: Python
-   - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `uvicorn app:app --host 0.0.0.0 --port $PORT`
-   - **Plan**: Free (or paid for better performance)
-3. **Deploy**
-
-### Environment Variables
-
-Set these in Render dashboard (optional):
-
-- `PYTHON_VERSION`: 3.11.0
-- `PORT`: 8000 (auto-set by Render)
-
-### Post-Deployment
-
-After deployment, test your service:
-
-```bash
-curl https://your-service-url.onrender.com/health
-```
-
-Expected response:
-```json
-{
-  "status": "healthy",
-  "model_loaded": true,
-  "lenders_configured": 15
-}
-```
-
-## Performance
-
-- **Cold Start**: 10-15 seconds (first request after idle)
-- **Warm Requests**: 1-2 seconds per request
-- **Model Size**: ~420MB (downloaded on first start)
-- **Memory Usage**: ~1GB
-
-## Upgrading to Paid Plan
-
-Free tier limitations:
-- Spins down after 15 min inactivity
-- Cold starts on each new request after idle
-- Limited CPU/RAM
-
-Consider upgrading if:
-- Need instant responses (no cold starts)
-- Processing > 100 requests/day
-- Need guaranteed uptime
-
-Paid plan: $7/month for always-on service
-
-## Integration with Supabase
-
-Update your Supabase Edge Function:
-
-```typescript
-// supabase/functions/analyze-mca/index.ts
-
-const ML_SERVICE_URL = Deno.env.get('ML_SERVICE_URL') || 
-  'https://fortifund-ml-service.onrender.com';
-
-const mlResponse = await fetch(`${ML_SERVICE_URL}/predict`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ transactions: debits }),
-});
-
-const mlData = await mlResponse.json();
-const detected_lenders = mlData.detected_lenders;
-```
-
-Set `ML_SERVICE_URL` in Supabase environment variables.
-
-## Adding New Lenders
-
-### Method 1: Update app.py
-
-Edit the `lenders` dictionary in `app.py`:
-
-```python
-lenders = {
-    "OnDeck": ["ondeck", "ondeck capital", "on deck"],
-    "YourNewLender": ["new lender name", "nlender", "nl payments"]
-}
-```
-
-Redeploy the service.
-
-### Method 2: Dynamic Update (via API)
-
-Call the `/refresh-lenders` endpoint:
-
-```bash
-curl -X POST https://your-service.onrender.com/refresh-lenders \
-  -H "Content-Type: application/json" \
-  -d '{
-    "OnDeck": ["ondeck", "ondeck capital"],
-    "NewLender": ["new lender", "nl payments"]
-  }'
-```
-
-No redeployment needed!
-
-## Troubleshooting
-
-### Model Download Issues
-
-If model fails to download on Render:
-- Check build logs for errors
-- Ensure sufficient disk space (need ~500MB)
-- Model downloads automatically on first start
-
-### High Memory Usage
-
-If service crashes due to memory:
-- Upgrade to paid plan (more RAM)
-- Or reduce batch size in predictions
-
-### Slow Cold Starts
-
-Free tier spins down after 15 min idle. Solutions:
-- Keep warm with periodic health checks
-- Upgrade to paid plan (always-on)
-
-### CORS Errors
-
-Service has CORS enabled by default. If issues persist:
-- Check Supabase function is sending correct headers
-- Verify service URL is correct
+Contributions are welcome. Open an issue to discuss a change, then send a pull request.
 
 ## License
 
-MIT License - Free for commercial use
-
-## Support
-
-For issues or questions:
-- Check logs in Render dashboard
-- Test locally first: `uvicorn app:app --reload`
-- Verify model loads: Check `/health` endpoint
-
-## Changelog
-
-### v1.0.0 (2026-01-29)
-- Initial release
-- MPNet model integration
-- 15 pre-configured MCA lenders
-- RESTful API with FastAPI
-- Render.com deployment support
+Distributed under the MIT License. See [LICENSE](LICENSE).
